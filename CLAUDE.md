@@ -4,13 +4,13 @@ The room server for [Nintendo Direct Bingo](https://github.com/lmarcarini/ninten
 
 The frontend lives in a sibling folder, `../nintendo-direct-bingo` (React, hosted on Netlify). Its `CLAUDE.md` explains the card model; this file covers only the server. Rooms are an optional extra for the frontend: the card works solo and offline without this server. A failure here should cost players the sync and nothing more.
 
-**Status:** the project is scaffolded and `src/protocol.ts` (types, client message validation, text cleaning) is done and tested. The rest of the layout below is still to build, so `npm start` doesn't run yet.
+**Status:** the server is built and tested (unit tests plus an integration test over real sockets) but not deployed yet. The frontend's room client doesn't exist yet.
 
 ## Commands
 
 ```bash
-npm run dev     # node --watch src/server.ts
-npm start       # node src/server.ts (what Render runs)
+npm run dev     # node --watch src/main.ts
+npm start       # node src/main.ts (what Render runs)
 npm run check   # tsc --noEmit (Node strips types at runtime; this is the type check)
 npm run lint    # ESLint, --max-warnings 0
 npm test        # Vitest (`npm test -- run` runs once)
@@ -26,7 +26,8 @@ Node 24 running TypeScript directly (type stripping), so there's no build step. 
 
 ```
 src/
-  server.ts      http server + GET /healthz, WebSocket upgrade, origin check, connection caps, SIGTERM
+  main.ts        entry point: loadConfig, startServer, SIGTERM/SIGINT → close
+  server.ts      startServer: http server + GET /healthz, WebSocket upgrade, origin check, connection caps, heartbeat, sweep, close
   config.ts      env → validated config with defaults; throws at startup on bad values
   protocol.ts    message types + strict validators and text sanitizers (mirrored in the frontend)
   roomCard.ts    pure: the room's card and applying one op to it
@@ -35,7 +36,9 @@ src/
   rateLimit.ts   token bucket
 ```
 
-Pure modules (`protocol`, `roomCard`, `rooms`, `rateLimit`) don't import `ws`, so they're testable without sockets. Inject time (`now()`) and timers where expiry matters.
+Pure modules (`protocol`, `roomCard`, `rooms`, `rateLimit`) don't import `ws`, so they're testable without sockets. Time is injected (`now`). Expiry has no timers of its own: `server.ts` calls `rooms.sweep()` every 5s, which releases stale locks and frees rooms past their grace period, and a lock that expired before a sweep can already be taken over.
+
+`rooms.join` returns a `Member` (or an error code), with one method per operation; a player is a `send` function, so `rooms.ts` never sees a socket. `connection.ts` parses each frame, handles the handshake and dispatches operations to the `Member`.
 
 ## Model
 
@@ -45,8 +48,9 @@ All state is in memory, and nothing is ever written to disk or a database.
 rooms: Map<string, Room>   // a Map, never an object: a room can be named "__proto__"
 Room = {
   card: RoomCard,                    // the shared card, already validated
-  players: Map<PlayerId, Player>,    // Player = { name, socket }
+  players: Map<PlayerId, Player>,    // Player = { id, name, send }
   locks: Map<Target, Lock>,          // Target = "title" | 0..24; Lock = { by: PlayerId, at: ms }
+  nextId: number,                    // player ids are "p1", "p2", … per room
   emptySince?: number,
 }
 ```
@@ -70,17 +74,21 @@ Client → server:
 | `text`     | `target`, `text`                        | only accepted from the lock holder; full text, not a diff |
 | `mark`     | `i`, `on`                               | sets the mark rather than toggling it, so a repeat is harmless; last write wins |
 | `settings` | any of `n`, `th`, `mk`, `a`, `dg`, `el` | last write wins, no lock |
-| `clear`    | (none)                                  | empties every square that isn't locked by someone else |
+| `clear`    | (none)                                  | empties every square that isn't locked by someone else, and turns every mark off (the frontend's Clear) |
+| `clear-marks` | (none)                               | turns every mark off (one message, not one `mark` per square, which could hit the rate limit) |
 | `ping`     | (none)                                  | answered with `pong`; also keeps Render's free instance awake |
 
 `parseClientMessage` returns the message, or `null` for anything that isn't exactly valid. It cleans text on the way in, so what it returns is safe to store and relay. It accepts any integer `v`; the connection compares it to `PROTOCOL_VERSION`, so a mismatch gets `4000` and not a generic `invalid`. `ServerMessage` only has types for now: the frontend's copy will add a `parseServerMessage` that validates them.
 
-Server → client: `joined { you, card, players, locks }`, `player-joined`, `player-left`, `locked { target, by }`, `unlocked { target }`, `text { target, text, by }`, `mark`, `settings`, `cleared { squares }`, `error { code }` and `pong`.
+Server → client: `joined { you, card, players, locks }`, `player-joined`, `player-left`, `locked { target, by }`, `unlocked { target }`, `text { target, text, by }`, `mark`, `settings`, `cleared { squares }` (those squares are now empty and all marks are off; `[]` after `clear-marks`), `error { code }` and `pong`.
+
+Close codes: `4000` protocol version mismatch (reload, don't reconnect), `4001` no `join` in time, `1012` server restarting (reconnect and rejoin), `1008` rate limit, `1009` message too big, `1003` binary frame.
 
 - **Operations are applied one at a time and sent to everyone, including the sender.** Clients apply what the server sends back, so concurrent marks and settings converge.
 - **The one exception is `text`, which isn't sent back to its sender.** It would rewind the cursor of the person typing, and only the lock holder can write that target anyway.
+- **A player holds at most one lock.** Taking a new one releases the last, so nobody can lock the whole card.
 - **A lock is released** on `unlock`, when its holder disconnects, or after `LOCK_TIMEOUT_MS` without a `text` or `lock` from the holder. Each release sends `unlocked`.
-- **A refused operation gets an `error` with a code** (`room-full`, `rooms-full`, `name-taken`, `locked`, `invalid`, `rate-limited`, …) and changes nothing. Never echo the input back.
+- **A refused operation gets an `error` with a code** (`invalid`, `version`, `not-joined`, `rooms-full`, `room-full`, `locked`, `rate-limited`) and changes nothing. Never echo the input back. A connection joins once; a second `join` is `invalid`.
 
 ## Security
 
@@ -88,13 +96,14 @@ Every message is untrusted: anyone can open a socket and send anything. The fron
 
 **On connection**
 - Accept an upgrade only if `Origin` is in `ALLOWED_ORIGINS` (exact match). This only stops other websites, not scripts, so the caps below still apply.
-- Cap total connections (`MAX_CONNECTIONS`) and connections per IP (`MAX_CONNECTIONS_PER_IP`). The IP is the first `X-Forwarded-For` entry, which Render sets.
+- Cap total connections (`MAX_CONNECTIONS`) and connections per IP (`MAX_CONNECTIONS_PER_IP`). The IP is the first `X-Forwarded-For` entry, which Render sets. Anyone reaching the server another way can spoof it, so the per-IP cap is a courtesy and `MAX_CONNECTIONS` is the limit that holds.
+- Upgrades are only accepted on `/`. Refusals are plain HTTP responses: `403` origin, `404` path, `503` cap.
 - Close a socket with `4001` if it doesn't send a valid `join` within `HANDSHAKE_TIMEOUT_MS`.
 - Ping every socket every 30s and terminate the ones that don't answer.
 - Create the `WebSocketServer` with `maxPayload: MAX_MESSAGE_BYTES` and `perMessageDeflate: false` (compression allows CPU and memory abuse).
 
 **For each message**
-- Rate-limit each connection with a token bucket (`RATE_BURST`, `RATE_PER_SEC`). Drop messages over the limit and send `rate-limited`, and close with `1008` if it keeps happening.
+- Rate-limit each connection with a token bucket (`RATE_BURST`, `RATE_PER_SEC`). Drop messages over the limit, send `rate-limited` once per run of drops, and close with `1008` after `RATE_BURST` drops in a row.
 - Only accept text frames. `JSON.parse` goes inside try/catch.
 - Validation is strict, unlike the frontend's lenient `fromPayload`, which fills in defaults for bad links. Here any of the following rejects the message: an unknown `type`, a missing field, an extra key, a wrong type, a non-integer or out-of-range index (`0..24`, `n` ∈ {16, 25}, `m` within 25 bits).
 - **Theme and marker ids** are only checked for format (`^[a-z0-9-]{1,32}$`). The frontend maps unknown ids to defaults, so adding a theme doesn't need a server deploy.
@@ -102,7 +111,8 @@ Every message is untrusted: anyone can open a socket and send anything. The fron
 
 **Text** (in `protocol.ts`, applied to the room name, player name, title and squares)
 - Normalize to NFC, strip control characters (squares keep `\n`, collapsed to at most 2 in a row) and bidi override/isolate characters (U+202A–U+202E, U+2066–U+2069), then trim.
-- Length limits are in code points, after cleaning: title ≤ 80, square ≤ 150, player name 1–20, unique within a room (case-insensitive). The frontend applies the same limits.
+- Length limits are in code points, after cleaning: title ≤ 80, square ≤ 150, player name 1–20. The frontend applies the same limits.
+- Player names don't have to be unique: a reconnecting phone can rejoin while its old socket is still waiting to be dropped by the heartbeat. Player ids tell players apart.
 - Room names are lowercased and must match `^[a-z0-9-]{3,32}$`. A room name works as its password, so the frontend should suggest one that's hard to guess.
 - Text is never interpreted, only stored and relayed. The frontend renders it with `textContent`.
 
@@ -138,6 +148,6 @@ Read once in `config.ts` and validated (positive integers, non-empty origin list
 
 ## Deploy (Render, free plan)
 
-A Web Service connected to this GitHub repo: runtime Node, build `npm ci`, start `npm start`, health check path `/healthz`, region Virginia (closest to Brazil). Set `ALLOWED_ORIGINS` to the Netlify URL. The server must listen on `process.env.PORT`, on all interfaces.
+A Web Service connected to this GitHub repo: runtime Node, build `npm ci`, start `npm start`, health check path `/healthz`, region Virginia (closest to Brazil). Set `ALLOWED_ORIGINS` to the Netlify URL. The server listens on `PORT` (which Render sets), on all interfaces. After the first deploy, check once that the first `X-Forwarded-For` entry really is the client's address (it decides the per-IP cap).
 
 The free plan sleeps after 15 minutes without inbound traffic and takes about a minute to wake up. The frontend shows "connecting…" in the meantime and sends a `ping` every few minutes while in a room. Restarts can happen at any time, which the rejoin-recreates rule above handles. The plan includes 750 instance hours a month.

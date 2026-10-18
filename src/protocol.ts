@@ -55,7 +55,7 @@ export type ClientMessage =
   | { type: "text"; target: Target; text: string }
   | { type: "mark"; i: number; on: boolean }
   | ({ type: "settings" } & Settings)
-  | { type: "clear" | "ping" };
+  | { type: "clear" | "clear-marks" | "ping" };
 
 export type ErrorCode =
   | "invalid"
@@ -63,7 +63,6 @@ export type ErrorCode =
   | "not-joined"
   | "rooms-full"
   | "room-full"
-  | "name-taken"
   | "locked"
   | "rate-limited";
 
@@ -82,7 +81,7 @@ export type ServerMessage =
   | { type: "text"; target: Target; text: string; by: PlayerId }
   | { type: "mark"; i: number; on: boolean }
   | ({ type: "settings" } & Settings)
-  | { type: "cleared"; squares: number[] }
+  | { type: "cleared"; squares: number[] } // those squares emptied, all marks off
   | { type: "error"; code: ErrorCode }
   | { type: "pong" };
 
@@ -265,6 +264,7 @@ export const parseClientMessage = (raw: string): ClientMessage | null => {
       return { type, ...settings };
     }
     case "clear":
+    case "clear-marks":
     case "ping":
       return hasKeys(data, ["type"]) ? { type } : null;
     default:

@@ -198,6 +198,7 @@ describe("parseClientMessage: operations", () => {
       dg: 1,
     });
     expect(parse({ type: "clear" })).toEqual({ type: "clear" });
+    expect(parse({ type: "clear-marks" })).toEqual({ type: "clear-marks" });
     expect(parse({ type: "ping" })).toEqual({ type: "ping" });
   });
 

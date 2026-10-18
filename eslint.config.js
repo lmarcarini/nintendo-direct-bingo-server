@@ -11,5 +11,9 @@ export default defineConfig([
       ecmaVersion: 2024,
       globals: globals.node,
     },
+    rules: {
+      // `const { type, ...rest } = message` is how a field gets dropped
+      '@typescript-eslint/no-unused-vars': ['error', { ignoreRestSiblings: true }],
+    },
   },
 ])

@@ -7,8 +7,8 @@
     "node": "^24.0.0 || >=26.0.0"
   },
   "scripts": {
-    "dev": "node --watch src/server.ts",
-    "start": "node src/server.ts",
+    "dev": "node --watch src/main.ts",
+    "start": "node src/main.ts",
     "check": "tsc",
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0",
     "test": "vitest"
