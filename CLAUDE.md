@@ -4,7 +4,7 @@ The room server for [Nintendo Direct Bingo](https://github.com/lmarcarini/ninten
 
 The frontend lives in a sibling folder, `../nintendo-direct-bingo` (React, hosted on Netlify). Its `CLAUDE.md` explains the card model; this file covers only the server. Rooms are an optional extra for the frontend: the card works solo and offline without this server. A failure here should cost players the sync and nothing more.
 
-**Status:** the server is built and tested (unit tests plus an integration test over real sockets) but not deployed yet. The frontend's room client doesn't exist yet.
+**Status:** the server is built, tested (unit tests plus an integration test over real sockets) and deployed on Render. The frontend's room client doesn't exist yet.
 
 ## Commands
 
@@ -96,7 +96,7 @@ Every message is untrusted: anyone can open a socket and send anything. The fron
 
 **On connection**
 - Accept an upgrade only if `Origin` is in `ALLOWED_ORIGINS` (exact match). This only stops other websites, not scripts, so the caps below still apply.
-- Cap total connections (`MAX_CONNECTIONS`) and connections per IP (`MAX_CONNECTIONS_PER_IP`). The IP is the first `X-Forwarded-For` entry, which Render sets. Anyone reaching the server another way can spoof it, so the per-IP cap is a courtesy and `MAX_CONNECTIONS` is the limit that holds.
+- Cap total connections (`MAX_CONNECTIONS`) and connections per IP (`MAX_CONNECTIONS_PER_IP`). The IP is the **last** `X-Forwarded-For` entry. Render's proxy keeps whatever the client sent and adds the address it saw at the end, so earlier entries are spoofable (checked against the deployed server: 11 connections with different fake first entries all got past a cap of 10). `MAX_CONNECTIONS` is the limit that holds regardless.
 - Upgrades are only accepted on `/`. Refusals are plain HTTP responses: `403` origin, `404` path, `503` cap.
 - Close a socket with `4001` if it doesn't send a valid `join` within `HANDSHAKE_TIMEOUT_MS`.
 - Ping every socket every 30s and terminate the ones that don't answer.
@@ -148,6 +148,6 @@ Read once in `config.ts` and validated (positive integers, non-empty origin list
 
 ## Deploy (Render, free plan)
 
-A Web Service connected to this GitHub repo: runtime Node, build `npm ci`, start `npm start`, health check path `/healthz`, region Virginia (closest to Brazil). Set `ALLOWED_ORIGINS` to the Netlify URL. The server listens on `PORT` (which Render sets), on all interfaces. After the first deploy, check once that the first `X-Forwarded-For` entry really is the client's address (it decides the per-IP cap).
+A Web Service connected to this GitHub repo: runtime Node, build `npm ci`, start `npm start`, health check path `/healthz`, region Virginia (closest to Brazil). Set `ALLOWED_ORIGINS` to the Netlify URL. The server listens on `PORT` (which Render sets), on all interfaces. Production: https://nintendo-direct-bingo-server.onrender.com (`wss://…/` for the socket), with `ALLOWED_ORIGINS=https://ndirectbingo.netlify.app`. For local development, run the server locally (its default origin is the Vite dev server) instead of adding localhost to production.
 
 The free plan sleeps after 15 minutes without inbound traffic and takes about a minute to wake up. The frontend shows "connecting…" in the meantime and sends a `ping` every few minutes while in a room. Restarts can happen at any time, which the rejoin-recreates rule above handles. The plan includes 750 instance hours a month.

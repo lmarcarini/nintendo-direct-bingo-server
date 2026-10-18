@@ -38,8 +38,8 @@ afterEach(async () => {
 });
 
 // An open socket with its incoming messages as a queue
-const connect = async (origin = ORIGIN) => {
-  const ws = new WebSocket(url, { origin });
+const connect = async (origin = ORIGIN, headers: Record<string, string> = {}) => {
+  const ws = new WebSocket(url, { origin, headers });
   clients.push(ws);
   const inbox: ServerMessage[] = [];
   const waiting: ((message: ServerMessage) => void)[] = [];
@@ -163,6 +163,19 @@ describe("room server", () => {
     await Promise.all([connect(), connect(), connect()]);
     const [error] = await once(new WebSocket(url, { origin: ORIGIN }), "error");
     expect((error as Error).message).toMatch(/503/);
+  });
+
+  it("counts IPs by the last X-Forwarded-For entry, which Render's proxy adds", async () => {
+    // Clients can put anything first; Render appends the address it saw
+    const via = (i: number) => ({ "X-Forwarded-For": `203.0.113.${i}, 198.51.100.1` });
+    await Promise.all([connect(ORIGIN, via(1)), connect(ORIGIN, via(2)), connect(ORIGIN, via(3))]);
+    const [error] = await once(
+      new WebSocket(url, { origin: ORIGIN, headers: via(4) }),
+      "error"
+    );
+    expect((error as Error).message).toMatch(/503/);
+    // A different real address still gets in
+    await connect(ORIGIN, { "X-Forwarded-For": "198.51.100.2" });
   });
 
   it("closes a connection that doesn't join in time", async () => {

@@ -14,15 +14,13 @@ export const CLOSE_RESTART = 1012;
 
 export type RunningServer = { port: number; close: () => Promise<void> };
 
-// Render's proxy puts the client's address first. It can be spoofed when
-// reaching the server some other way, so the per-IP cap is only a courtesy:
-// MAX_CONNECTIONS is the limit that holds
+// Render's proxy keeps the X-Forwarded-For a client sends and adds the
+// address it saw at the end, so only the last entry can be trusted (checked
+// against the deployed server: varying the first entry got past the cap)
 const clientIp = (req: IncomingMessage) => {
-  const forwarded = req.headers["x-forwarded-for"];
-  const first = (Array.isArray(forwarded) ? forwarded[0] : forwarded)
-    ?.split(",")[0]
-    ?.trim();
-  return first || req.socket.remoteAddress || "unknown";
+  const forwarded = [req.headers["x-forwarded-for"] ?? []].flat().join(",");
+  const last = forwarded.split(",").at(-1)?.trim();
+  return last || req.socket.remoteAddress || "unknown";
 };
 
 const refuse = (socket: Duplex, status: string) => {
