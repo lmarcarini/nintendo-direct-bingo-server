@@ -92,6 +92,11 @@ export type ServerMessage =
 // width joiner holds emoji sequences together
 const BIDI_CONTROLS = /[‪-‮⁦-⁩]/g;
 
+// In a `u` regex a surrogate pair is one code point, so this only matches a
+// lone surrogate (what String.prototype.isWellFormed checks, in older
+// browsers too: the frontend runs this file)
+const LONE_SURROGATE = /\p{Cs}/u;
+
 // Normalizes text and returns it, or null if it's not a string, isn't
 // well-formed UTF-16 or is too long once cleaned
 const cleanText = (
@@ -99,13 +104,15 @@ const cleanText = (
   maxLength: number,
   multiline: boolean
 ): string | null => {
-  if (typeof value !== "string" || !value.isWellFormed()) return null;
+  if (typeof value !== "string" || LONE_SURROGATE.test(value)) return null;
   let text = value.normalize("NFC").replace(BIDI_CONTROLS, "");
   text = multiline
     ? text
         .replace(/\r\n?/g, "\n")
         .replace(/\t/g, " ")
-        .replace(/[\p{Cc}--[\n]]/gv, "")
+        .split("\n")
+        .map((line) => line.replace(/\p{Cc}/gu, ""))
+        .join("\n")
         .replace(/\n{3,}/g, "\n\n")
     : text
         .replace(/\s+/g, " ")
@@ -181,8 +188,8 @@ const parseSettings = (fields: Fields): Settings | null => {
   return settings;
 };
 
-// The card sent on join: the frontend's payload, where a missing field
-// holds its default
+// A card: the frontend's payload sent on join, where a missing field holds
+// its default, or the full RoomCard the server sends back
 const parseCard = (value: unknown): RoomCard | null => {
   if (!isObject(value) || !hasKeys(value, [], CARD_KEYS)) return null;
   const settings = parseSettings(value);
@@ -215,17 +222,39 @@ const parseCard = (value: unknown): RoomCard | null => {
   return { ...DEFAULT_ROOM_CARD, ...settings, t, s, m };
 };
 
+const parseObject = (raw: string): Fields | null => {
+  try {
+    const data: unknown = JSON.parse(raw);
+    return isObject(data) ? data : null;
+  } catch {
+    return null;
+  }
+};
+
+const parseText = (target: Target, value: unknown) =>
+  target === "title" ? cleanTitle(value) : cleanSquare(value);
+
+// The messages both sides send with the same shape
+const parseMark = (data: Fields) =>
+  hasKeys(data, ["type", "i", "on"]) &&
+  isIndex(data.i) &&
+  typeof data.on === "boolean"
+    ? { type: "mark" as const, i: data.i, on: data.on }
+    : null;
+
+const parseSettingsMessage = (data: Fields) => {
+  if (!hasKeys(data, ["type"], SETTING_KEYS)) return null;
+  const settings = parseSettings(data);
+  if (!settings || !Object.keys(settings).length) return null;
+  return { type: "settings" as const, ...settings };
+};
+
 // Parses one frame from a client. Anything that isn't exactly a valid
 // message is null; the protocol version is checked by the caller, so it can
 // answer a mismatch differently
 export const parseClientMessage = (raw: string): ClientMessage | null => {
-  let data: unknown;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!isObject(data)) return null;
+  const data = parseObject(raw);
+  if (!data) return null;
 
   const type = data.type;
   switch (type) {
@@ -248,24 +277,129 @@ export const parseClientMessage = (raw: string): ClientMessage | null => {
       if (!hasKeys(data, ["type", "target", "text"])) return null;
       const target = parseTarget(data.target);
       if (target === null) return null;
-      const text =
-        target === "title" ? cleanTitle(data.text) : cleanSquare(data.text);
+      const text = parseText(target, data.text);
       return text === null ? null : { type, target, text };
     }
-    case "mark": {
-      if (!hasKeys(data, ["type", "i", "on"])) return null;
-      if (!isIndex(data.i) || typeof data.on !== "boolean") return null;
-      return { type, i: data.i, on: data.on };
-    }
-    case "settings": {
-      if (!hasKeys(data, ["type"], SETTING_KEYS)) return null;
-      const settings = parseSettings(data);
-      if (!settings || !Object.keys(settings).length) return null;
-      return { type, ...settings };
-    }
+    case "mark":
+      return parseMark(data);
+    case "settings":
+      return parseSettingsMessage(data);
     case "clear":
     case "clear-marks":
     case "ping":
+      return hasKeys(data, ["type"]) ? { type } : null;
+    default:
+      return null;
+  }
+};
+
+// The server's messages, checked just as strictly: to the frontend, the
+// server is untrusted input too. Player ids are the server's "p1", "p2", …
+
+const PLAYER_ID = /^p[1-9]\d{0,8}$/;
+const MAX_PLAYERS_LISTED = 100;
+const ERROR_CODES: readonly ErrorCode[] = [
+  "invalid",
+  "version",
+  "not-joined",
+  "rooms-full",
+  "room-full",
+  "locked",
+  "rate-limited",
+];
+
+const isPlayerId = (value: unknown): value is PlayerId =>
+  typeof value === "string" && PLAYER_ID.test(value);
+
+const parsePlayer = (value: unknown): PlayerInfo | null => {
+  if (!isObject(value) || !hasKeys(value, ["id", "name"])) return null;
+  const name = cleanPlayerName(value.name);
+  return isPlayerId(value.id) && name !== null ? { id: value.id, name } : null;
+};
+
+const parseLock = (value: unknown): LockInfo | null => {
+  if (!isObject(value) || !hasKeys(value, ["target", "by"])) return null;
+  const target = parseTarget(value.target);
+  return target !== null && isPlayerId(value.by)
+    ? { target, by: value.by }
+    : null;
+};
+
+// An array of at most `max` items, all of which parse
+const parseList = <T>(
+  value: unknown,
+  parse: (item: unknown) => T | null,
+  max: number
+): T[] | null => {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const items: T[] = [];
+  for (const item of value) {
+    const parsed = parse(item);
+    if (parsed === null) return null;
+    items.push(parsed);
+  }
+  return items;
+};
+
+export const parseServerMessage = (raw: string): ServerMessage | null => {
+  const data = parseObject(raw);
+  if (!data) return null;
+
+  const type = data.type;
+  switch (type) {
+    case "joined": {
+      if (!hasKeys(data, ["type", "you", "card", "players", "locks"]))
+        return null;
+      const card = parseCard(data.card);
+      const players = parseList(data.players, parsePlayer, MAX_PLAYERS_LISTED);
+      const locks = parseList(data.locks, parseLock, MAX_SQUARES + 1);
+      if (!isPlayerId(data.you) || !card || !players || !locks) return null;
+      return { type, you: data.you, card, players, locks };
+    }
+    case "player-joined": {
+      if (!hasKeys(data, ["type", "player"])) return null;
+      const player = parsePlayer(data.player);
+      return player && { type, player };
+    }
+    case "player-left":
+      return hasKeys(data, ["type", "id"]) && isPlayerId(data.id)
+        ? { type, id: data.id }
+        : null;
+    case "locked":
+    case "unlocked": {
+      const keys = type === "locked" ? ["type", "target", "by"] : ["type", "target"];
+      if (!hasKeys(data, keys)) return null;
+      const target = parseTarget(data.target);
+      if (target === null) return null;
+      if (type === "unlocked") return { type, target };
+      return isPlayerId(data.by) ? { type, target, by: data.by } : null;
+    }
+    case "text": {
+      if (!hasKeys(data, ["type", "target", "text", "by"])) return null;
+      const target = parseTarget(data.target);
+      if (target === null || !isPlayerId(data.by)) return null;
+      const text = parseText(target, data.text);
+      return text === null ? null : { type, target, text, by: data.by };
+    }
+    case "mark":
+      return parseMark(data);
+    case "settings":
+      return parseSettingsMessage(data);
+    case "cleared": {
+      if (!hasKeys(data, ["type", "squares"])) return null;
+      const squares = parseList(
+        data.squares,
+        (i) => (isIndex(i) ? i : null),
+        MAX_SQUARES
+      );
+      return squares && { type, squares };
+    }
+    case "error":
+      return hasKeys(data, ["type", "code"]) &&
+        ERROR_CODES.includes(data.code as ErrorCode)
+        ? { type, code: data.code as ErrorCode }
+        : null;
+    case "pong":
       return hasKeys(data, ["type"]) ? { type } : null;
     default:
       return null;

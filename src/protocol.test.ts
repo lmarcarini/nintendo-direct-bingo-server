@@ -6,6 +6,8 @@ import {
   cleanTitle,
   DEFAULT_ROOM_CARD,
   parseClientMessage,
+  parseServerMessage,
+  type ServerMessage,
 } from "./protocol.ts";
 
 const parse = (message: unknown) => parseClientMessage(JSON.stringify(message));
@@ -256,5 +258,69 @@ describe("parseClientMessage: frames", () => {
         '{"type":"join","v":1,"room":"abc","name":"a","card":{"__proto__":{"t":"x"}}}'
       )
     ).toBeNull();
+  });
+});
+
+describe("parseServerMessage", () => {
+  const server = (message: unknown) => parseServerMessage(JSON.stringify(message));
+
+  it("parses each message the server sends", () => {
+    const messages: ServerMessage[] = [
+      {
+        type: "joined",
+        you: "p2",
+        card: DEFAULT_ROOM_CARD,
+        players: [
+          { id: "p1", name: "Ana" },
+          { id: "p2", name: "Leo" },
+        ],
+        locks: [{ target: "title", by: "p1" }],
+      },
+      { type: "player-joined", player: { id: "p3", name: "Mia" } },
+      { type: "player-left", id: "p3" },
+      { type: "locked", target: 4, by: "p1" },
+      { type: "unlocked", target: 4 },
+      { type: "text", target: 4, text: "Zelda", by: "p1" },
+      { type: "mark", i: 4, on: false },
+      { type: "settings", n: 25 },
+      { type: "cleared", squares: [0, 1, 24] },
+      { type: "cleared", squares: [] },
+      { type: "error", code: "room-full" },
+      { type: "pong" },
+    ];
+    for (const message of messages) expect(server(message)).toEqual(message);
+  });
+
+  it("cleans text from the server too", () => {
+    expect(
+      server({ type: "text", target: "title", text: "a‮\nb", by: "p1" })
+    ).toMatchObject({ text: "a b" });
+    expect(
+      server({ type: "player-joined", player: { id: "p1", name: " Ana\u0000 " } })
+    ).toEqual({ type: "player-joined", player: { id: "p1", name: "Ana" } });
+  });
+
+  it.each([
+    ["a bad player id", { type: "player-left", id: "admin" }],
+    ["a player id of p0", { type: "player-left", id: "p0" }],
+    ["a locked without by", { type: "locked", target: 1 }],
+    ["an unlocked with by", { type: "unlocked", target: 1, by: "p1" }],
+    ["text over the limit", { type: "text", target: 1, text: "a".repeat(151), by: "p1" }],
+    ["a square index in cleared out of range", { type: "cleared", squares: [25] }],
+    ["too many cleared squares", { type: "cleared", squares: Array(26).fill(0) }],
+    ["an unknown error code", { type: "error", code: "pwned" }],
+    ["an extra key", { type: "pong", html: "<b>" }],
+    ["a joined with an invalid card", { type: "joined", you: "p1", card: { m: -1 }, players: [], locks: [] }],
+    ["a joined with an invalid player", { type: "joined", you: "p1", card: {}, players: [{ id: "p1" }], locks: [] }],
+    ["a joined with too many players", {
+      type: "joined",
+      you: "p1",
+      card: {},
+      players: Array.from({ length: 101 }, (_, i) => ({ id: `p${i + 1}`, name: "x" })),
+      locks: [],
+    }],
+    ["a client-only type", { type: "clear" }],
+  ])("rejects %s", (_, message) => {
+    expect(server(message)).toBeNull();
   });
 });

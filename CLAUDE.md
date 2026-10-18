@@ -4,7 +4,7 @@ The room server for [Nintendo Direct Bingo](https://github.com/lmarcarini/ninten
 
 The frontend lives in a sibling folder, `../nintendo-direct-bingo` (React, hosted on Netlify). Its `CLAUDE.md` explains the card model; this file covers only the server. Rooms are an optional extra for the frontend: the card works solo and offline without this server. A failure here should cost players the sync and nothing more.
 
-**Status:** the server is built, tested (unit tests plus an integration test over real sockets) and deployed on Render. The frontend's room client doesn't exist yet.
+**Status:** built, tested (unit tests plus an integration test over real sockets) and deployed on Render. The frontend's room client is in `../nintendo-direct-bingo/src/room/`, with Playwright tests that run against this server.
 
 ## Commands
 
@@ -78,7 +78,9 @@ Client → server:
 | `clear-marks` | (none)                               | turns every mark off (one message, not one `mark` per square, which could hit the rate limit) |
 | `ping`     | (none)                                  | answered with `pong`; also keeps Render's free instance awake |
 
-`parseClientMessage` returns the message, or `null` for anything that isn't exactly valid. It cleans text on the way in, so what it returns is safe to store and relay. It accepts any integer `v`; the connection compares it to `PROTOCOL_VERSION`, so a mismatch gets `4000` and not a generic `invalid`. `ServerMessage` only has types for now: the frontend's copy will add a `parseServerMessage` that validates them.
+`parseClientMessage` returns the message, or `null` for anything that isn't exactly valid. It cleans text on the way in, so what it returns is safe to store and relay. It accepts any integer `v`; the connection compares it to `PROTOCOL_VERSION`, so a mismatch gets `4000` and not a generic `invalid`. `parseServerMessage` checks the server's messages just as strictly; the server doesn't use it, but the frontend does, and it's tested here.
+
+**The frontend runs this file**, copied verbatim to `../nintendo-direct-bingo/src/room/protocol.ts`. After changing it, copy it over (`diff` should show nothing) and run the frontend's tests. It has no imports, and it only uses what both Node and browsers back to Safari 16 support (the frontend's TypeScript lib is ES2022): no regex `v` flag, no `isWellFormed`, no `Array.prototype.with`.
 
 Server → client: `joined { you, card, players, locks }`, `player-joined`, `player-left`, `locked { target, by }`, `unlocked { target }`, `text { target, text, by }`, `mark`, `settings`, `cleared { squares }` (those squares are now empty and all marks are off; `[]` after `clear-marks`), `error { code }` and `pong`.
 
